@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 import re
 import pandas as pd
 import shutil
+import sys
 import customtkinter as ctk
 from openpyxl import load_workbook
 
@@ -36,6 +37,17 @@ from typing import Optional, Tuple
 
 CENTRAL_TZ = ZoneInfo("America/Chicago")
 
+def get_app_base_dir() -> Path:
+    """
+    When running as PyInstaller onefile exe:
+      - sys.executable = path to the exe
+    When running as .py:
+      - __file__ = this script path
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
 def get_daily_db_path(tool_prefix: str = "ncop") -> str:
     """
     Daily-versioned + cumulative, but detection is based ONLY on database/ folder.
@@ -47,7 +59,7 @@ def get_daily_db_path(tool_prefix: str = "ncop") -> str:
         - Move all other .db files in database/ to database/previous_versions/
     - Does NOT look at previous_versions/ when choosing the base DB.
     """
-    base_dir = Path(__file__).resolve().parent
+    base_dir = get_app_base_dir()
     db_dir = base_dir / "database"
     prev_dir = db_dir / "previous_versions"
     db_dir.mkdir(parents=True, exist_ok=True)
@@ -316,7 +328,7 @@ class NCOPImporterApp(ctk.CTk):
         self.ACCENT_HOVER = "#ffab4c"
         self.TEXT_DARK = "#273946"
 
-        self.title("NCOP: DB Import Manager [v1.0.0]")
+        self.title("NCOP: DB Import Manager [v1.0.2]")
         self.geometry("430x720")
         self.resizable(False, True)
         self.minsize(430, 650)
