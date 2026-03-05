@@ -15,7 +15,7 @@ from tkinter import messagebox
 from zoneinfo import ZoneInfo
 import re
 import pandas as pd
-
+import shutil
 import customtkinter as ctk
 from openpyxl import load_workbook
 
@@ -32,14 +32,20 @@ from datetime import datetime
 from datetime import date
 from fractions import Fraction
 from pathlib import Path
+from typing import Optional, Tuple
 
 CENTRAL_TZ = ZoneInfo("America/Chicago")
 
 def get_daily_db_path(tool_prefix: str = "ncop") -> str:
     """
-    Ensures database/ contains exactly ONE active db for TODAY.
-    Any other dbs in database/ are moved to database/previous_versions/.
-    Returns today's active db path.
+    Daily-versioned + cumulative, but detection is based ONLY on database/ folder.
+
+    - Active DB lives in database/: YYYY-MM-DD-<tool_prefix>.db
+    - If today's DB doesn't exist:
+        - Find latest YYYY-MM-DD-<tool_prefix>.db in database/ ONLY
+        - Copy it to today's DB (so today includes history)
+        - Move all other .db files in database/ to database/previous_versions/
+    - Does NOT look at previous_versions/ when choosing the base DB.
     """
     base_dir = Path(__file__).resolve().parent
     db_dir = base_dir / "database"
@@ -51,18 +57,42 @@ def get_daily_db_path(tool_prefix: str = "ncop") -> str:
     today_name = f"{today_str}-{tool_prefix}.db"
     today_path = db_dir / today_name
 
-    # Move any other DBs sitting in database/ into previous_versions/
+    # Case 1: today's DB already exists
+    if today_path.exists():
+        for p in db_dir.glob("*.db"):
+            if p.is_file() and p.name != today_name:
+                p.rename(prev_dir / p.name)
+        return str(today_path), None, "existing"
+
+    # Find latest dated DB in database/
+    pat = re.compile(rf"^(\d{{4}}-\d{{2}}-\d{{2}})-{re.escape(tool_prefix)}\.db$")
+    candidates = []
+    for p in db_dir.glob("*.db"):
+        m = pat.match(p.name)
+        if m:
+            candidates.append((m.group(1), p))
+
+    latest_path = sorted(candidates, key=lambda x: x[0])[-1][1] if candidates else None
+
+    # Case 2: copy forward from latest base DB
+    if latest_path and latest_path.exists():
+        shutil.copy2(latest_path, today_path)
+        copied_from = latest_path.name
+
+        # archive other DBs
+        for p in db_dir.glob("*.db"):
+            if p.is_file() and p.name != today_name:
+                p.rename(prev_dir / p.name)
+
+        return str(today_path), copied_from, "copied"
+
+    # Case 3: truly new (no base DB)
+    # (No need to create the file here; connect_sqlite will create it when connecting.)
     for p in db_dir.glob("*.db"):
         if p.is_file() and p.name != today_name:
             p.rename(prev_dir / p.name)
 
-    # (Optional safety) If previous_versions already has same name, avoid collision
-    # Not usually needed unless you rerun on the same day after copying files around.
-    if today_path.exists():
-        return str(today_path)
-
-    # Create path (SQLite will create file on connect)
-    return str(today_path)
+    return str(today_path), None, "new"
 
 def is_excel_hash_overflow(v) -> bool:
     if v is None:
@@ -135,8 +165,14 @@ def read_input_file(path: str, sheet_name: str | None = None) -> pd.DataFrame:
     # --- Read via pandas first (fast) ---
     xls = pd.ExcelFile(path)
     sheet = sheet_name or xls.sheet_names[0]
-    df = pd.read_excel(xls, sheet_name=sheet, dtype=str).fillna("")
-
+    df = pd.read_excel(
+        xls,
+        sheet_name=sheet,
+        dtype=str,
+        keep_default_na=False,  # ✅ do not convert stuff into NaN
+        na_filter=False,        # ✅ don’t treat blanks/tokens as NaN
+    ).fillna("")
+    
     PHONE_COLS = {
         "Phone1", "Phone2", "Phone3", "Phone4",
         "CLEANED PHONE1", "CLEANED PHONE2", "CLEANED PHONE3", "CLEANED PHONE4",
@@ -182,10 +218,24 @@ def read_input_file(path: str, sheet_name: str | None = None) -> pd.DataFrame:
                 continue
 
             for row_i in range(n):
-                if is_excel_hash_overflow(df.at[row_i, col]):
+                v = df.at[row_i, col]
+
+                # pandas might give "", NaN, or "#######" depending on how it read the file
+                is_blank_or_nan = (v == "") or pd.isna(v)
+                is_hash = is_excel_hash_overflow(v)
+
+                if is_blank_or_nan or is_hash:
                     xl_cell = ws.cell(row=2 + row_i, column=excel_col_idx)
                     raw = xl_cell.value
-                    df.at[row_i, col] = "" if raw is None else str(raw)
+
+                    # store raw cell value as text
+                    if raw is None:
+                        df.at[row_i, col] = ""
+                    elif isinstance(raw, (int, float)):
+                        # avoid "9723612930.0"
+                        df.at[row_i, col] = str(int(raw)) if float(raw).is_integer() else str(raw)
+                    else:
+                        df.at[row_i, col] = str(raw)
 
         # --- 2) Extract real hyperlink targets for Heirship Report Link ---
         if HEIRSHIP_COL in df.columns:
@@ -413,7 +463,7 @@ class NCOPImporterApp(ctk.CTk):
         # scrollable list WRAPPER (controls the height)
         list_wrap = ctk.CTkFrame(panel, fg_color="#1e2b34", height=80, corner_radius=10)
         list_wrap.pack(fill="x", expand=False, padx=10, pady=(0, 10))
-        list_wrap.pack_propagate(False)  # ✅ force the wrapper height
+        list_wrap.pack_propagate(False)  # force the wrapper height
 
         self.files_list = ctk.CTkScrollableFrame(
             list_wrap,
@@ -438,7 +488,7 @@ class NCOPImporterApp(ctk.CTk):
         self.input_paths = []
         self.file_label.configure(text="(none)")
         self._refresh_files_list()
-        self._log("[INFO] Cleared selected files.")
+        self._log("[INFO] Cleared selected files.\n")
 
     def _refresh_files_list(self):
         # remove existing rows
@@ -506,6 +556,7 @@ class NCOPImporterApp(ctk.CTk):
         self._refresh_files_list()  # ✅ update list UI
 
         self._log("[INFO] Selected inputs:\n  - " + "\n  - ".join(self.input_paths))
+        self._log("\n")
 
     def start_import(self):
         self._divider()
@@ -514,43 +565,55 @@ class NCOPImporterApp(ctk.CTk):
             messagebox.showwarning("Missing input", "Please select one or more CSV/XLSX files.")
             return
 
-        db_path = get_daily_db_path("ncop")
-        self._log(f"[DB] Using daily DB: {db_path}")
+        db_path, copied_from, mode = get_daily_db_path("ncop")
+        self._log(f"[DB] Using daily DB: {db_path}\n")
+
+        if mode == "copied":
+            self._log(f"[DB] Copied base DB: {copied_from}\n")
+        elif mode == "existing":
+            self._log("[DB] Today's DB already exists. Continuing append..\n")
+        else:  # "new"
+            self._log("[DB] No base DB found. Starting a NEW DB for today.\n")
 
         table = "ncop"
 
         self.import_btn.configure(state="disabled")
         self.pick_file_btn.configure(state="disabled")
-        self.progress_callback(0, "Starting import...")
+        self.progress_callback(0, "Starting import...\n")
 
         threading.Thread(
             target=self._import_worker,
-            args=(self.input_paths, table),
+            args=(db_path, self.input_paths, table),
             daemon=True
         ).start()
 
-    def _import_worker(self, input_paths, table):
-        db_path = get_daily_db_path("ncop")
+    def _import_worker(self, db_path, input_paths, table):
 
         try:
             conn = connect_sqlite(db_path)
             try:
                 total_files = len(input_paths)
+                audit_chunks = []  # collects audit_df from each input file
 
                 for idx, input_path in enumerate(input_paths, start=1):
-                    self.progress_callback(0, f"[{idx}/{total_files}] Reading: {os.path.basename(input_path)}")
+                    self.progress_callback(0, f"[{idx}/{total_files}] Reading: {os.path.basename(input_path)}\n")
                     df_raw = read_input_file(input_path)  # ✅ no sheet_name
                     
                     if df_raw.empty:
-                        self._log(f"[SKIP] {os.path.basename(input_path)} has no rows.")
+                        self._log(f"[SKIP] {os.path.basename(input_path)} has no rows.\n")
                         continue
 
-                    self.progress_callback(0, f"[{idx}/{total_files}] Cleaning/standardizing...")
-                    df, original_cols, sanitized_cols, phone_cols, date_cols = clean_and_prepare_df(df_raw)
+                    self.progress_callback(0, f"[{idx}/{total_files}] Cleaning/standardizing...\n")
+                    df, original_cols, sanitized_cols, phone_cols, date_cols, audit_df = clean_and_prepare_df(df_raw)
 
+                    if audit_df is not None and not audit_df.empty:
+                        audit_df = audit_df.copy()
+                        audit_df.insert(0, "source_file", os.path.basename(input_path))
+                        audit_chunks.append(audit_df)
+                        
                     if not table_exists(conn, table):
                         # first-ever import: create table + columns
-                        self._log("[SCHEMA] Table not found. Creating schema from this first file...")
+                        self._log("[SCHEMA] Table not found. Creating schema from this first file...\n")
                         ensure_table_and_columns(conn, table, list(df.columns))
                     else:
                         # strict mode: validate only (no new columns allowed)
@@ -561,26 +624,26 @@ class NCOPImporterApp(ctk.CTk):
                             original_cols=original_cols,
                             sanitized_cols=sanitized_cols,
                         )
-                        self._log("[SCHEMA] OK: incoming columns match existing DB schema.")
+                        self._log("[SCHEMA] OK: incoming columns match existing DB schema.\n")
 
-                    self._log(f"[{idx}/{total_files}] {os.path.basename(input_path)}: {len(df):,} rows")
-                    self._log(f"[MAP] Columns: {len(original_cols)} original → {len(sanitized_cols)} sanitized")
+                    self._log(f"[{idx}/{total_files}] {os.path.basename(input_path)}: {len(df):,} rows\n")
+                    self._log(f"[MAP] Columns: {len(original_cols)} original → {len(sanitized_cols)} sanitized\n")
 
-                    if phone_cols:
-                        self._log(f"[TYPE] Phone columns: {', '.join(phone_cols[:12])}" + ("..." if len(phone_cols) > 12 else ""))
-                    if date_cols:
-                        self._log(f"[DATE] Date columns: {', '.join(date_cols[:12])}" + ("..." if len(date_cols) > 12 else ""))
+                    # if phone_cols:
+                    #     self._log(f"[TYPE] Phone columns: {', '.join(phone_cols[:12])}" + ("..." if len(phone_cols) > 12 else ""))
+                    # if date_cols:
+                    #     self._log(f"[DATE] Date columns: {', '.join(date_cols[:12])}" + ("..." if len(date_cols) > 12 else ""))
 
-                    self.progress_callback(0, f"[{idx}/{total_files}] Preparing table...")
+                    self.progress_callback(0, f"[{idx}/{total_files}] Preparing table...\n")
                     ensure_table_and_columns(conn, table, list(df.columns))
 
                     existing_cols = get_existing_columns(conn, table)
                     if "ncop_id" not in existing_cols:
-                        self._log("[WARN] Existing table has no ncop_id PK. Inserts will still work, but PK will not be auto-added.")
+                        self._log("[WARN] Existing table has no ncop_id PK. Inserts will still work, but PK will not be auto-added.\n")
                     if "date_uploaded" not in existing_cols:
-                        self._log("[WARN] date_uploaded was missing and should have been added.")
+                        self._log("[WARN] date_uploaded was missing and should have been added.\n")
 
-                    self.progress_callback(0, f"[{idx}/{total_files}] Inserting rows...")
+                    self.progress_callback(0, f"[{idx}/{total_files}] Inserting rows...\n")
                     insert_rows(
                         conn,
                         table,
@@ -589,7 +652,24 @@ class NCOPImporterApp(ctk.CTk):
                         tz=CENTRAL_TZ
                     )
 
-                self._log(f"[DONE] Daily DB updated: {os.path.basename(db_path)} → table '{table}'")
+                # --- Save audit report (if any) ---
+                if audit_chunks:
+                    audit_all = pd.concat(audit_chunks, ignore_index=True)
+
+                    out_dir = Path(__file__).resolve().parent / "output"
+                    out_dir.mkdir(parents=True, exist_ok=True)
+
+                    ts = datetime.now(CENTRAL_TZ).strftime("%Y-%m-%d_%H%M%S")
+                    audit_path = out_dir / f"ncop_null_audit_{ts}.xlsx"
+
+                    with pd.ExcelWriter(audit_path, engine="openpyxl") as writer:
+                        audit_all.to_excel(writer, sheet_name="null_conversions", index=False)
+
+                    self._log(f"[AUDIT] Saved NULL conversion audit: {audit_path}\n")
+                else:
+                    self._log("[AUDIT] No suspicious NULL conversions detected.\n")
+                    
+                self._log(f"[DONE] Daily DB updated: {os.path.basename(db_path)} → table '{table}'\n")
                 self.after(0, lambda: messagebox.showinfo("Success", f"Imported into:\n{db_path}\n\nTable: {table}"))
 
             finally:
@@ -597,7 +677,7 @@ class NCOPImporterApp(ctk.CTk):
 
         except Exception as e:
             err_msg = str(e)
-            self._log(f"[ERROR] {err_msg}")
+            self._log(f"[ERROR] {err_msg}\n")
             self._ui_error("Error", err_msg)
 
         finally:
