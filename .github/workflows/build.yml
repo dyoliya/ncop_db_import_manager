@@ -27,7 +27,7 @@ jobs:
 
       - name: Build executable with PyInstaller
         run: |
-          pyinstaller --onefile --windowed --name nocp_db_import_mgr app.py
+          pyinstaller --onefile --windowed --name ncop_db_import_mgr app.py
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
