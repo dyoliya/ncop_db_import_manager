@@ -32,6 +32,6 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
-          files: dist/budb_upload_to_mysql.exe
+          files: dist/ncop_db_import_mgr.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
