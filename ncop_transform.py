@@ -1,8 +1,11 @@
 import re
 import pandas as pd
 
-NULL_LIKE = {"", "#N/A", "N/A", "NA", "NULL", "null", "nan", "NaN"}
-
+NULL_LIKE_RAW = {
+    "", "#N/A", "N/A", "NA", "NULL", "nan", "#REF",
+    "#VALUE!", "#REF!", "#DIV/0!", "#NAME?", "#NUM!", "#NULL!"
+}
+NULL_LIKE = {x.strip().casefold() for x in NULL_LIKE_RAW}
 
 def sanitize_colname(name: str) -> str:
     """
@@ -112,17 +115,16 @@ def coerce_nulls(x):
     if x is None:
         return None
     s = str(x).strip()
-    if s in NULL_LIKE:
+    if s.casefold() in NULL_LIKE:
         return None
     return s
-
 
 def normalize_phone_value(x):
     """Keep phone values as TEXT and avoid float artifacts like 12345.0, preserve NULLs."""
     if x is None:
         return None
     s = str(x).strip()
-    if s in NULL_LIKE:
+    if s.casefold() in NULL_LIKE:
         return None
 
     if re.fullmatch(r"\d+\.0", s):
@@ -155,24 +157,81 @@ def standardize_date_series(series: pd.Series) -> pd.Series:
 
 def clean_and_prepare_df(df_raw: pd.DataFrame):
     original_cols = list(df_raw.columns)
-
     sanitized = make_unique([sanitize_colname(c) for c in original_cols])
 
     df = df_raw.copy(deep=True)
     df.columns = sanitized
 
-    # NULL-like -> None
+    audit_records = []
+
+    def _as_text_series(s: pd.Series) -> pd.Series:
+        return s.map(lambda x: "" if pd.isna(x) else str(x))
+
+    def audit_stage(stage: str, before_df: pd.DataFrame, after_df: pd.DataFrame, cols: list[str], reason: str):
+        for c in cols:
+            if c not in before_df.columns or c not in after_df.columns:
+                continue
+
+            before_col = _as_text_series(before_df[c])
+            after_col = after_df[c]
+
+            # suspicious: had something (non-empty) then became NULL/None
+            after_missing = after_df[c].map(lambda v: v is None or pd.isna(v))
+            mask = (before_col.str.strip() != "") & (after_missing)
+
+            if mask.any():
+                for idx in after_df.index[mask]:
+                    audit_records.append({
+                        "row_index": int(idx) + 2,  # assumes header is row 1
+                        "column_sanitized": c,
+                        "original_value": before_col.loc[idx],
+                        "cleaned_value": None,
+                        "stage": stage,
+                        "reason": reason,
+                    })
+
+    # ---------------- Stage 1: NULL-like -> None ----------------
+    before1 = df.copy(deep=True)
     for c in df.columns:
         df[c] = df[c].map(coerce_nulls)
 
-    # Explicit phones
+    audit_stage(
+        stage="coerce_nulls",
+        before_df=before1,
+        after_df=df,
+        cols=list(df.columns),
+        reason="Non-empty value became NULL via NULL_LIKE/coerce_nulls",
+    )
+
+    # ---------------- Stage 2: phones ----------------
     phone_cols = [c for c in df.columns if c in EXPLICIT_PHONE_COLS]
-    for c in phone_cols:
-        df[c] = df[c].map(normalize_phone_value)
+    if phone_cols:
+        before2 = df.copy(deep=True)
+        for c in phone_cols:
+            df[c] = df[c].map(normalize_phone_value)
 
-    # Explicit dates
+        audit_stage(
+            stage="normalize_phone_value",
+            before_df=before2,
+            after_df=df,
+            cols=phone_cols,
+            reason="Non-empty value became NULL during phone normalization",
+        )
+
+    # ---------------- Stage 3: dates ----------------
     date_cols = [c for c in df.columns if c in EXPLICIT_DATE_COLS]
-    for c in date_cols:
-        df[c] = standardize_date_series(df[c])
+    if date_cols:
+        before3 = df.copy(deep=True)
+        for c in date_cols:
+            df[c] = standardize_date_series(df[c])
 
-    return df, original_cols, sanitized, phone_cols, date_cols
+        audit_stage(
+            stage="standardize_date_series",
+            before_df=before3,
+            after_df=df,
+            cols=date_cols,
+            reason="Non-empty value became NULL during date standardization",
+        )
+
+    audit_df = pd.DataFrame(audit_records)
+    return df, original_cols, sanitized, phone_cols, date_cols, audit_df
