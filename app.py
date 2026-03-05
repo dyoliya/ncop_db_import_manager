@@ -316,7 +316,7 @@ class NCOPImporterApp(ctk.CTk):
         self.ACCENT_HOVER = "#ffab4c"
         self.TEXT_DARK = "#273946"
 
-        self.title("NCOP: DB Import Manager [demo_v1]")
+        self.title("NCOP: DB Import Manager [v1.0.0]")
         self.geometry("430x720")
         self.resizable(False, True)
         self.minsize(430, 650)
