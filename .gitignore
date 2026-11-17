@@ -10,3 +10,6 @@ dist/
 build/
 database/
 .vscode/
+required_columns.txt
+input/
+cache/

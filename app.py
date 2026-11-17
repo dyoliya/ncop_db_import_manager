@@ -18,6 +18,8 @@ import pandas as pd
 import shutil
 import sys
 import customtkinter as ctk
+import sqlite3
+import pymysql
 from openpyxl import load_workbook
 
 from customtkinter import filedialog
@@ -27,8 +29,14 @@ from ncop_sqlite import (
     connect_sqlite,
     ensure_table_and_columns,
     get_existing_columns,
-    insert_rows,
+    sync_rows_by_ncop_id,
 )
+from ncop_deal_id_matcher import populate_ncop_deal_ids_in_df
+from ncop_prod import load_prod_lookup_maps, populate_prod_ids_in_df
+from ncop_budb import load_budb_lookup_maps, populate_budb_ids_in_df
+from ncop_po import load_pooling_lookup_maps, populate_po_ids_in_df
+from ncop_existing_deals_report import generate_ncop_associated_deals_report
+
 from datetime import datetime
 from datetime import date
 from fractions import Fraction
@@ -125,7 +133,7 @@ def get_expected_columns(conn, table_name: str) -> set[str]:
     # existing DB columns
     cols = set(get_existing_columns(conn, table_name))
     # ignore system columns you add automatically
-    ignore = {"ncop_id", "date_uploaded"}
+    ignore = {"ncop_id", "date_uploaded", "serial_number"}
     return {c for c in cols if c not in ignore}
 
 
@@ -135,15 +143,21 @@ def validate_strict_schema(
     original_cols: list[str] | None = None,
     sanitized_cols: list[str] | None = None,
 ):
-    incoming_set = set(incoming_cols)
+    system_cols = {"ncop_id", "date_uploaded", "serial_number"}
 
-    missing = sorted(expected_cols - incoming_set)
-    extra = sorted(incoming_set - expected_cols)
+    incoming_set = set(incoming_cols) - system_cols
+    expected_set = set(expected_cols) - system_cols
 
-    if not missing and not extra:
-        return  # ok
+    # Missing columns are now allowed.
+    # Meaning: if Excel lacks a DB column, we accept it.
+    missing = sorted(expected_set - incoming_set)
 
-    # optional: show mapping help
+    # Extra columns are still not allowed.
+    extra = sorted(incoming_set - expected_set)
+
+    if not extra:
+        return
+
     mapping_info = ""
     if original_cols is not None and sanitized_cols is not None:
         pairs = list(zip(original_cols, sanitized_cols))
@@ -153,14 +167,14 @@ def validate_strict_schema(
         if len(pairs) > 80:
             mapping_info += "\n  ... (truncated)"
 
-    msg_lines = ["Schema mismatch: incoming file columns do not match existing DB schema."]
+    msg_lines = ["Schema mismatch: incoming file has unexpected columns."]
 
     if missing:
-        msg_lines.append("\nMissing required columns (expected in DB, not found in file):")
+        msg_lines.append("\nAllowed missing columns detected. These are in DB but not in Excel:")
         msg_lines += [f"  - {c}" for c in missing]
 
     if extra:
-        msg_lines.append("\nUnexpected columns (present in file, not in DB schema):")
+        msg_lines.append("\nUnexpected columns present in Excel but not in DB:")
         msg_lines += [f"  - {c}" for c in extra]
 
     raise ValueError("\n".join(msg_lines) + mapping_info)
@@ -317,6 +331,211 @@ def read_input_file(path: str, sheet_name: str | None = None) -> pd.DataFrame:
         except Exception:
             pass
 
+
+def split_pipe_ids(value):
+    if value is None or pd.isna(value):
+        return []
+
+    s = str(value).strip()
+    if not s or s.lower() in {"nan", "none", "null"}:
+        return []
+
+    return [x.strip() for x in s.split("|") if x.strip()]
+
+
+def add_county_state_pair(items, county, state):
+    county = "" if county is None or pd.isna(county) else str(county).strip().upper()
+    state = "" if state is None or pd.isna(state) else str(state).strip().upper()
+
+    if not county or not state:
+        return
+
+    # PO can be: "CAMPBELL, CONVERSE" or "CAMPBELL & CONVERSE"
+    counties = re.split(r"\s*(?:,|&)\s*", county)
+
+    for c in counties:
+        c = c.strip().upper()
+        if c:
+            items.append(f"{c}, {state}")
+
+
+def parse_existing_combined_county(value):
+    items = []
+
+    if value is None or pd.isna(value):
+        return items
+
+    s = str(value).strip()
+    if not s or s.lower() in {"nan", "none", "null"}:
+        return items
+
+    for part in s.split("|"):
+        part = part.strip().upper()
+        if part:
+            items.append(part)
+
+    return items
+
+
+def unique_pipe_join(items):
+    seen = set()
+    output = []
+
+    for item in items:
+        item = str(item).strip().upper()
+        if not item:
+            continue
+
+        if item not in seen:
+            seen.add(item)
+            output.append(item)
+
+    return " | ".join(output)
+
+
+def load_budb_county_lookup(budb_path):
+    if not budb_path:
+        return {}
+
+    conn = sqlite3.connect(str(budb_path))
+    try:
+        query = """
+            SELECT
+                [id] AS budb_id,
+                [County] AS county,
+                [State] AS state
+            FROM [bottoms_up]
+        """
+        df = pd.read_sql_query(query, conn)
+
+        lookup = {}
+        for row in df.itertuples(index=False):
+            budb_id = "" if pd.isna(row.budb_id) else str(row.budb_id).strip()
+            if not budb_id:
+                continue
+
+            items = []
+            add_county_state_pair(items, row.county, row.state)
+            lookup[budb_id] = items
+
+        return lookup
+
+    finally:
+        conn.close()
+
+
+def load_po_county_lookup(pooling_path):
+    if not pooling_path:
+        return {}
+
+    conn = sqlite3.connect(str(pooling_path))
+    try:
+        query = """
+            SELECT
+                [po_id] AS po_id,
+                [target_county] AS county,
+                [target_state] AS state
+            FROM [pooling_order]
+        """
+        df = pd.read_sql_query(query, conn)
+
+        lookup = {}
+        for row in df.itertuples(index=False):
+            po_id = "" if pd.isna(row.po_id) else str(row.po_id).strip()
+            if not po_id:
+                continue
+
+            items = []
+            add_county_state_pair(items, row.county, row.state)
+            lookup[po_id] = items
+
+        return lookup
+
+    finally:
+        conn.close()
+
+
+def load_prod_county_lookup(mysql_config, prod_ids):
+    prod_ids = sorted({str(x).strip() for x in prod_ids if str(x).strip()})
+
+    if not prod_ids:
+        return {}
+
+    lookup = {}
+
+    conn = pymysql.connect(
+        host=mysql_config["host"],
+        user=mysql_config["user"],
+        password=mysql_config["password"],
+        database=mysql_config["database"],
+        port=mysql_config.get("port", 3306),
+        charset="utf8mb4",
+        cursorclass=pymysql.cursors.DictCursor,
+    )
+
+    try:
+        with conn.cursor() as cursor:
+            placeholders = ", ".join(["%s"] * len(prod_ids))
+
+            query = f"""
+                SELECT
+                    contact_id,
+                    country AS county,
+                    state
+                FROM contact_targets
+                WHERE contact_id IN ({placeholders})
+            """
+
+            cursor.execute(query, prod_ids)
+            rows = cursor.fetchall()
+
+        for row in rows:
+            prod_id = "" if row.get("contact_id") is None else str(row.get("contact_id")).strip()
+            if not prod_id:
+                continue
+
+            lookup.setdefault(prod_id, [])
+            add_county_state_pair(lookup[prod_id], row.get("county"), row.get("state"))
+
+        return lookup
+
+    finally:
+        conn.close()
+
+
+def populate_combined_counties_from_all_sources(
+    df,
+    budb_county_lookup,
+    po_county_lookup,
+    # prod_county_lookup,
+):
+    combined_values = []
+
+    for row in df.itertuples(index=False):
+        items = []
+
+        # 1. NCOP existing combined_county
+        items.extend(parse_existing_combined_county(getattr(row, "combined_county", "")))
+
+        # 2. BUDB matched counties
+        for budb_id in split_pipe_ids(getattr(row, "budb_id", "")):
+            items.extend(budb_county_lookup.get(budb_id, []))
+
+        # 3. PO matched counties
+        for po_id in split_pipe_ids(getattr(row, "po_id", "")):
+            items.extend(po_county_lookup.get(po_id, []))
+
+        # 4. PROD matched counties
+        # for prod_id in split_pipe_ids(getattr(row, "prod_id", "")):
+        #     items.extend(prod_county_lookup.get(prod_id, []))
+
+        combined_values.append(unique_pipe_join(items))
+
+    df = df.copy()
+    df["combined_counties_from_all_sources"] = combined_values
+    return df
+
+
 class NCOPImporterApp(ctk.CTk):
     def __init__(self):
         super().__init__()
@@ -328,7 +547,7 @@ class NCOPImporterApp(ctk.CTk):
         self.ACCENT_HOVER = "#ffab4c"
         self.TEXT_DARK = "#273946"
 
-        self.title("NCOP: DB Import Manager [v1.0.2]")
+        self.title("NCOP: DB Import Manager [v1.0.3]")
         self.geometry("430x720")
         self.resizable(False, True)
         self.minsize(430, 650)
@@ -489,7 +708,7 @@ class NCOPImporterApp(ctk.CTk):
         # Import button
         self.import_btn = ctk.CTkButton(
             tab,
-            text="Import & Append to DB",
+            text="Import & Sync to DB",
             fg_color=self.ACCENT,
             hover_color=self.ACCENT_HOVER,
             command=self.start_import
@@ -583,7 +802,7 @@ class NCOPImporterApp(ctk.CTk):
         if mode == "copied":
             self._log(f"[DB] Copied base DB: {copied_from}\n")
         elif mode == "existing":
-            self._log("[DB] Today's DB already exists. Continuing append..\n")
+            self._log("[DB] Today's DB already exists. Continuing sync..\n")
         else:  # "new"
             self._log("[DB] No base DB found. Starting a NEW DB for today.\n")
 
@@ -603,6 +822,27 @@ class NCOPImporterApp(ctk.CTk):
 
         try:
             conn = connect_sqlite(db_path)
+
+            mysql_config = {
+                "host": "communitymineralsproduction-instance-1.cwonazo2qluf.us-east-2.rds.amazonaws.com",
+                "user": "admin",
+                "password": "cmpass2024",
+                "database": "prod_community_minerals",
+                "port": 3306,
+            }
+
+            prod_lookup_maps, prod_meta = load_prod_lookup_maps(
+                mysql_config=mysql_config,
+                base_dir=get_app_base_dir(),
+            )
+
+            budb_lookup_maps, budb_meta = load_budb_lookup_maps(
+                base_dir=get_app_base_dir()
+            )
+
+            po_lookup_maps, po_meta = load_pooling_lookup_maps(
+                base_dir=get_app_base_dir()
+            )
             try:
                 total_files = len(input_paths)
                 audit_chunks = []  # collects audit_df from each input file
@@ -618,17 +858,102 @@ class NCOPImporterApp(ctk.CTk):
                     self.progress_callback(0, f"[{idx}/{total_files}] Cleaning/standardizing...\n")
                     df, original_cols, sanitized_cols, phone_cols, date_cols, audit_df = clean_and_prepare_df(df_raw)
 
+                    self.progress_callback(0, f"[{idx}/{total_files}] Matching Pipedrive deal IDs...\n")
+
+                    df, pd_meta, deal_match_audit_df = populate_ncop_deal_ids_in_df(
+                        df,
+                        base_dir=get_app_base_dir(),
+                        progress_callback=lambda frac: self.progress_callback(frac),
+                    )
+
+                    matched_count = df["deal_id"].notna().sum()
+                    self._log(
+                        f"[PIPEDRIVE] Deal ID matching complete. "
+                        f"Matched: {matched_count:,}/{len(df):,} rows | "
+                        f"Source rows loaded: {pd_meta.get('rows_loaded', 0):,}\n"
+                    )
+
+                    self.progress_callback(0, f"[{idx}/{total_files}] Matching PROD IDs...\n")
+
+                    df = populate_prod_ids_in_df(
+                        df,
+                        prod_lookup_maps,
+                        progress_callback=lambda frac: self.progress_callback(frac),
+                    )
+
+                    self._log(
+                        f"[PROD] PROD ID matching complete. "
+                        f"Matched: {df['prod_id'].notna().sum():,}/{len(df):,} rows | "
+                        f"Source rows loaded: {prod_meta.get('rows_loaded', 0):}\n"
+                    )
+
+                    self.progress_callback(0, f"[{idx}/{total_files}] Matching BUDB IDs...\n")
+
+                    df = populate_budb_ids_in_df(
+                        df,
+                        budb_lookup_maps,
+                        progress_callback=lambda frac: self.progress_callback(frac),
+                    )
+
+                    self._log(
+                        f"[BUDB] BUDB ID matching complete. "
+                        f"Matched: {df['budb_id'].notna().sum():,}/{len(df):,} rows | "
+                        f"Source rows loaded: {budb_meta.get('rows_loaded', 0):}\n"
+                    )
+
+                    self.progress_callback(0, f"[{idx}/{total_files}] Matching PO IDs.\n")
+
+                    df = populate_po_ids_in_df(
+                        df,
+                        po_lookup_maps,
+                        progress_callback=lambda frac: self.progress_callback(frac),
+                    )
+
+                    self._log(
+                        f"[PO] PO ID matching complete. "
+                        f"Matched: {df['po_id'].notna().sum():,}/{len(df):,} rows | "
+                        f"Source rows loaded: {po_meta.get('rows_loaded', 0):}\n"
+                    )
+
+                    self.progress_callback(0, f"[{idx}/{total_files}] Combining counties from all sources...\n")
+
+                    budb_county_lookup = load_budb_county_lookup(budb_meta.get("budb_path"))
+                    po_county_lookup = load_po_county_lookup(po_meta.get("pooling_path"))
+
+                    all_prod_ids = []
+                    for value in df.get("prod_id", pd.Series(dtype=str)):
+                        all_prod_ids.extend(split_pipe_ids(value))
+
+                    # prod_county_lookup = load_prod_county_lookup(mysql_config, all_prod_ids)
+
+                    df = populate_combined_counties_from_all_sources(
+                        df=df,
+                        budb_county_lookup=budb_county_lookup,
+                        po_county_lookup=po_county_lookup,
+                        # prod_county_lookup=prod_county_lookup,
+                    )
+
+                    self._log(
+                        f"[COUNTY] combined_counties_from_all_sources populated for "
+                        f"{df['combined_counties_from_all_sources'].astype(str).str.strip().ne('').sum():,}/{len(df):,} rows.\n"
+                    )
+                    if "ncop_id" in df.columns:
+                        self._log("[INFO] Input contains ncop_id. File values will be used when present.\n")
+                    else:
+                        self._log("[INFO] Input has no ncop_id. DB will auto-generate IDs.\n")
+
                     if audit_df is not None and not audit_df.empty:
                         audit_df = audit_df.copy()
                         audit_df.insert(0, "source_file", os.path.basename(input_path))
                         audit_chunks.append(audit_df)
-                        
+
                     if not table_exists(conn, table):
-                        # first-ever import: create table + columns
                         self._log("[SCHEMA] Table not found. Creating schema from this first file...\n")
                         ensure_table_and_columns(conn, table, list(df.columns))
                     else:
-                        # strict mode: validate only (no new columns allowed)
+                        # Run migration first so system columns like serial_number are added/backfilled
+                        ensure_table_and_columns(conn, table, list(df.columns))
+
                         expected = get_expected_columns(conn, table)
                         validate_strict_schema(
                             incoming_cols=list(df.columns),
@@ -647,7 +972,6 @@ class NCOPImporterApp(ctk.CTk):
                     #     self._log(f"[DATE] Date columns: {', '.join(date_cols[:12])}" + ("..." if len(date_cols) > 12 else ""))
 
                     self.progress_callback(0, f"[{idx}/{total_files}] Preparing table...\n")
-                    ensure_table_and_columns(conn, table, list(df.columns))
 
                     existing_cols = get_existing_columns(conn, table)
                     if "ncop_id" not in existing_cols:
@@ -655,8 +979,18 @@ class NCOPImporterApp(ctk.CTk):
                     if "date_uploaded" not in existing_cols:
                         self._log("[WARN] date_uploaded was missing and should have been added.\n")
 
-                    self.progress_callback(0, f"[{idx}/{total_files}] Inserting rows...\n")
-                    insert_rows(
+                    # self.progress_callback(0, f"[{idx}/{total_files}] Inserting rows...\n")
+                    # sync_rows_by_ncop_id(
+                    #     conn,
+                    #     table,
+                    #     df,
+                    #     progress_callback=lambda frac: self.progress_callback(frac),
+                    #     tz=CENTRAL_TZ
+                    # )
+
+                    self.progress_callback(0, f"[{idx}/{total_files}] Syncing rows...\n")
+
+                    result = sync_rows_by_ncop_id(
                         conn,
                         table,
                         df,
@@ -664,15 +998,21 @@ class NCOPImporterApp(ctk.CTk):
                         tz=CENTRAL_TZ
                     )
 
+                    self._log(
+                        f"[SYNC] Inserted: {result['inserted']:,} | "
+                        f"Updated: {result['updated']:,} | "
+                        f"Unchanged: {result['unchanged']:,} | "
+                        f"Deleted: {result['deleted']:,}\n"
+                    )
                 # --- Save audit report (if any) ---
                 if audit_chunks:
                     audit_all = pd.concat(audit_chunks, ignore_index=True)
 
-                    out_dir = Path(__file__).resolve().parent / "output"
-                    out_dir.mkdir(parents=True, exist_ok=True)
+                    audit_dir = get_app_base_dir() / "audit"
+                    audit_dir.mkdir(parents=True, exist_ok=True)
 
                     ts = datetime.now(CENTRAL_TZ).strftime("%Y-%m-%d_%H%M%S")
-                    audit_path = out_dir / f"ncop_null_audit_{ts}.xlsx"
+                    audit_path = audit_dir / f"ncop_null_audit_{ts}.xlsx"
 
                     with pd.ExcelWriter(audit_path, engine="openpyxl") as writer:
                         audit_all.to_excel(writer, sheet_name="null_conversions", index=False)
@@ -680,7 +1020,33 @@ class NCOPImporterApp(ctk.CTk):
                     self._log(f"[AUDIT] Saved NULL conversion audit: {audit_path}\n")
                 else:
                     self._log("[AUDIT] No suspicious NULL conversions detected.\n")
+
+                self.progress_callback(0, "[REPORT] Generating NCOP associated deals report...\n")
+
+                report_result = generate_ncop_associated_deals_report(
+                    db_path=db_path,
+                    base_dir=get_app_base_dir(),
+                    table=table,
+                )
+
+                if deal_match_audit_df is not None and not deal_match_audit_df.empty:
+                    existing_deals_dir = get_app_base_dir() / "existing_deals"
+                    existing_deals_dir.mkdir(parents=True, exist_ok=True)
+
+                    date_prefix = Path(db_path).name[:10]
+                    audit_path = existing_deals_dir / f"{date_prefix}-ncop-deal-match-audit.xlsx"
+
+                    with pd.ExcelWriter(audit_path, engine="openpyxl") as writer:
+                        deal_match_audit_df.to_excel(writer, sheet_name="deal_match_audit", index=False)
+
+                    self._log(f"[AUDIT] Saved deal match audit: {audit_path}\n")
                     
+                self._log(
+                    f"[REPORT] Saved associated deals report: {report_result['output_path']}\n"
+                    f"[REPORT] Exported rows: {report_result['rows_exported']:,} | "
+                    f"NCOP rows with deal_id: {report_result['unique_ncop_rows']:,}\n"
+                )
+
                 self._log(f"[DONE] Daily DB updated: {os.path.basename(db_path)} → table '{table}'\n")
                 self.after(0, lambda: messagebox.showinfo("Success", f"Imported into:\n{db_path}\n\nTable: {table}"))
 

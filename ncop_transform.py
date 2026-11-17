@@ -44,8 +44,9 @@ def sanitize_colname(name: str) -> str:
     if s[0].isdigit():
         s = f"c_{s}"
 
+    # Allow incoming NCOP ID from the file to map to the real SQLite ncop_id
     if s == "ncop_id":
-        s = "ncop_id_col"
+        return "ncop_id"
 
     return s
 
