@@ -336,6 +336,9 @@ def load_pipedrive_lookup_maps(base_dir: str | Path):
         "Person - Mailing Address",
         "Deal - NCOP ID",
         "Deal - Serial Number",
+        "Deal - Label",
+        "Deal - Pipeline",
+        "Deal - Stage",
     }
     missing = sorted(required_cols - set(df_raw.columns))
     if missing:

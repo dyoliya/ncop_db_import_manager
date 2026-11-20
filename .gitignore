@@ -13,3 +13,5 @@ database/
 required_columns.txt
 input/
 cache/
+*.json
+NCOP_vs_DEO_Pre_Push_Review.md

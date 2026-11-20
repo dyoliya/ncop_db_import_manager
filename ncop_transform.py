@@ -56,6 +56,36 @@ def norm(name: str) -> str:
     return sanitize_colname(name)
 
 
+IGNORED_INPUT_COLUMNS = {
+    norm(name)
+    for name in (
+        "Owner ID",
+        "Llll",
+        "CONTACT COMPLETION",
+        "DECD",
+        "Checking",
+        "ST?",
+        "Marker",
+        "FOR %",
+        "Lookup:Owner",
+        "Lookup:Ownership Portion",
+        "WITH/WO",
+        "Report Date",
+        "Report Source File Name",
+        "Is Primary MO? (Y/N)",
+        "Is Representative? (Y/N)",
+        "Is Heir? (Y/N)",
+        "Heirship Notes",
+        "Heirship Info Source Link",
+    )
+}
+
+SHEET_SYSTEM_COLUMN_MAP = {
+    "ncop_serial_number": "serial_number",
+    "date_added_to_db": "date_uploaded",
+}
+
+
 EXPLICIT_DATE_COLS = {
     norm("ADD: Address1 First Seen"),
     norm("ADD: Address1 Last Seen"),
@@ -113,7 +143,7 @@ def make_unique(names: list[str]) -> list[str]:
 
 
 def coerce_nulls(x):
-    if x is None:
+    if x is None or pd.isna(x):
         return None
     s = str(x).strip()
     if s.casefold() in NULL_LIKE:
@@ -141,27 +171,96 @@ def normalize_phone_value(x):
 
 
 def standardize_date_series(series: pd.Series) -> pd.Series:
-    """Convert parseable values to YYYY-MM-DD; keep original if parse fails."""
+    """Return YYYY-MM-DD or NULL; stop if a nonblank date is invalid."""
     cleaned = series.map(coerce_nulls)
-    dt = pd.to_datetime(cleaned, errors="coerce")
+    converted = {}
 
-    out = []
-    for orig, parsed in zip(cleaned.tolist(), dt.tolist()):
-        if orig is None:
-            out.append(None)
-        elif parsed is pd.NaT or parsed is None:
-            out.append(orig)
+    # Parse each distinct value separately so mixed formats work.
+    for value in cleaned.dropna().unique():
+        if re.fullmatch(r"[+-]?\d+(?:\.\d+)?", value):
+            # Numeric values in date columns are spreadsheet serial dates.
+            parsed = pd.to_datetime(
+                float(value),
+                unit="D",
+                origin="1899-12-30",
+                errors="coerce",
+            )
         else:
-            out.append(parsed.date().strftime("%Y-%m-%d"))
-    return pd.Series(out, index=series.index)
+            parsed = pd.to_datetime(
+                value,
+                errors="coerce",
+                dayfirst=False,
+            )
+
+        if pd.isna(parsed):
+            rows = [
+                str(int(i) + 2)
+                for i in cleaned.index[cleaned == value][:10]
+            ]
+            raise ValueError(
+                f"Invalid date in {series.name!r}, "
+                f"Sheet row(s) {', '.join(rows)}: {value!r}"
+            )
+
+        converted[value] = parsed.strftime("%Y-%m-%d")
+
+    return cleaned.map(
+        lambda value: None if pd.isna(value) else converted[value]
+    )
 
 
 def clean_and_prepare_df(df_raw: pd.DataFrame):
     original_cols = list(df_raw.columns)
-    sanitized = make_unique([sanitize_colname(c) for c in original_cols])
+    sanitized = [sanitize_colname(c) for c in original_cols]
+
+    duplicates = sorted({
+        c for c in sanitized if sanitized.count(c) > 1
+    })
+    if duplicates:
+        raise ValueError(
+            "Headers normalize to duplicate column names: "
+            + ", ".join(duplicates)
+        )
 
     df = df_raw.copy(deep=True)
     df.columns = sanitized
+
+    if "fixed_combined_county" not in df.columns:
+        raise ValueError(
+            "Input must contain fixed_combined_county. "
+            "Export/include its calculated values before importing."
+        )
+
+    # Use the corrected county values, even when blank or an error.
+    df = df.drop(columns=["combined_county"], errors="ignore")
+    df = df.rename(columns={"fixed_combined_county": "combined_county"})
+
+    for sheet_col, db_col in SHEET_SYSTEM_COLUMN_MAP.items():
+        if sheet_col in df.columns:
+            if db_col in df.columns:
+                raise ValueError(
+                    f"Input contains both {sheet_col} and {db_col}; "
+                    "keep only the Sheet header."
+                )
+            df = df.rename(columns={sheet_col: db_col})
+
+    df = df.drop(columns=list(IGNORED_INPUT_COLUMNS), errors="ignore")
+
+    # Keep the diagnostic header mapping aligned with imported columns.
+    imported_pairs = []
+    for original, normalized in zip(original_cols, sanitized):
+        if normalized in IGNORED_INPUT_COLUMNS or normalized == "combined_county":
+            continue
+
+        target = (
+            "combined_county"
+            if normalized == "fixed_combined_county"
+            else SHEET_SYSTEM_COLUMN_MAP.get(normalized, normalized)
+        )
+        imported_pairs.append((original, target))
+
+    original_cols = [original for original, _ in imported_pairs]
+    sanitized = [target for _, target in imported_pairs]
 
     audit_records = []
 
@@ -220,7 +319,11 @@ def clean_and_prepare_df(df_raw: pd.DataFrame):
         )
 
     # ---------------- Stage 3: dates ----------------
-    date_cols = [c for c in df.columns if c in EXPLICIT_DATE_COLS]
+    date_cols = [
+        c for c in df.columns
+        if c in EXPLICIT_DATE_COLS
+        or c.replace("_", "").endswith(("firstseen", "lastseen"))
+    ]
     if date_cols:
         before3 = df.copy(deep=True)
         for c in date_cols:

@@ -104,6 +104,15 @@ def ensure_table_and_columns(conn: sqlite3.Connection, table: str, df_cols: list
         return
 
     existing = set(get_existing_columns(conn, table))
+
+    unwanted_column = "rangeid1873955911"
+    if unwanted_column in existing:
+        cur.execute(
+            f"ALTER TABLE {sqlite_quote_ident(table)} "
+            f"DROP COLUMN {sqlite_quote_ident(unwanted_column)}"
+        )
+        existing.remove(unwanted_column)
+
     required = {"ncop_id", "date_uploaded", "serial_number"} | set(df_cols)
     missing = [c for c in required if c not in existing]
 
@@ -127,7 +136,7 @@ def ensure_table_and_columns(conn: sqlite3.Connection, table: str, df_cols: list
         )
         conn.commit()
     
-    rebuild_table_with_serial_after_date_uploaded(conn, table)
+    # Preserve the existing table layout, indexes, and AUTOINCREMENT history.
 
 def clean_sql_value(x):
     if x is None:
@@ -153,6 +162,7 @@ def sync_rows_by_ncop_id(
     df,
     progress_callback=None,
     tz: ZoneInfo = CENTRAL_TZ,
+    commit: bool = True,
 ):
     """
     Sync Excel data against existing DB using ncop_id.
@@ -171,20 +181,19 @@ def sync_rows_by_ncop_id(
     if "ncop_id" not in df.columns:
         raise ValueError("Input file must contain ncop_id for sync mode.")
 
+    if df.empty:
+        raise ValueError("Input has no data rows; synchronization stopped.")
+
     def normalize_ncop_id(x):
-        if x is None:
+        if pd.isna(x):
             return "*0000"
 
         s = str(x).strip()
-
-        if s == "" or s == "*0000":
+        if s.casefold() in {"", "nan", "none", "null", "nat", "*0000"}:
             return "*0000"
 
-        if re.fullmatch(r"\d+\.0", s):
-            return s[:-2]
-
-        if re.fullmatch(r"\d+", s):
-            return s
+        if re.fullmatch(r"[0-9]+(?:\.0+)?", s):
+            return str(int(s.split(".")[0]))
 
         return s
 
@@ -210,10 +219,18 @@ def sync_rows_by_ncop_id(
 
     existing_cols = get_existing_columns(conn, table)
 
+    protected_columns = {"prod_id", "po_id", "source_url"}
+    preserved_insert_columns = [
+        c for c in ("prod_id", "po_id", "source_url")
+        if c in existing_cols
+    ]
     compare_cols = [
         c for c in df.columns
-        if c in existing_cols and c not in {"ncop_id", "date_uploaded", "serial_number"}
+        if c in existing_cols
+        and c not in {"ncop_id", "date_uploaded", "serial_number"}
+        and c not in protected_columns
     ]
+
 
     # Load existing DB rows
     select_cols = ["ncop_id", "date_uploaded"] + compare_cols
@@ -246,10 +263,20 @@ def sync_rows_by_ncop_id(
             (ncop_id,)
         )
 
-    # Get max ncop_id after delete
-    cur.execute(f"SELECT MAX(ncop_id) FROM {sqlite_quote_ident(table)}")
-    row = cur.fetchone()
-    current_max_id = int(row[0]) if row and row[0] is not None else 0
+    # Respect IDs present before this run deleted any rows.
+    current_max_id = max((int(v) for v in db_existing_ids), default=0)
+
+    # Also respect IDs allocated in previous runs, even if later deleted.
+    has_sequence = cur.execute(
+        "SELECT 1 FROM sqlite_master WHERE name = 'sqlite_sequence'"
+    ).fetchone()
+    if has_sequence:
+        sequence_row = cur.execute(
+            "SELECT seq FROM sqlite_sequence WHERE name = ?",
+            (table,),
+        ).fetchone()
+        if sequence_row:
+            current_max_id = max(current_max_id, int(sequence_row[0] or 0))
 
     max_file_id = max(
         [int(v) for v in excel_existing_ids],
@@ -264,8 +291,9 @@ def sync_rows_by_ncop_id(
     deleted = len(ids_to_delete)
 
     total_rows = len(df)
+    writeback_rows = []
 
-    for i, (_, row) in enumerate(df.iterrows(), start=1):
+    for i, (row_index, row) in enumerate(df.iterrows(), start=1):
         ncop_id = str(row["ncop_id"]).strip()
 
         is_new_marker = ncop_id == "*0000"
@@ -285,13 +313,17 @@ def sync_rows_by_ncop_id(
 
             serial_number = f"NCOP-{ncop_id}"
 
-            insert_cols = ["ncop_id", "date_uploaded", "serial_number"] + compare_cols
+            insert_cols = (
+                ["ncop_id", "date_uploaded", "serial_number"]
+                + compare_cols
+                + preserved_insert_columns
+            )
 
             insert_vals = [
                 ncop_id,
                 now_central,
                 serial_number,
-            ] + [row_values[c] for c in compare_cols]
+            ] + [row_values[c] for c in compare_cols] + [None] * len(preserved_insert_columns)
 
             sql = (
                 f"INSERT INTO {sqlite_quote_ident(table)} "
@@ -333,10 +365,24 @@ def sync_rows_by_ncop_id(
             else:
                 unchanged += 1
 
+        saved = cur.execute(
+            f"SELECT ncop_id, serial_number, date_uploaded "
+            f"FROM {sqlite_quote_ident(table)} WHERE ncop_id = ?",
+            (ncop_id,),
+        ).fetchone()
+
+        writeback_rows.append({
+            "sheet_row": int(row_index) + 2,
+            "ncop_id": int(saved[0]),
+            "ncop_serial_number": saved[1] or "",
+            "date_added_to_db": saved[2] or "",
+        })
+
         if progress_callback and i % 100 == 0:
             progress_callback(i / total_rows)
 
-    conn.commit()
+    if commit:
+        conn.commit()
 
     if progress_callback:
         progress_callback(1.0)
@@ -346,6 +392,7 @@ def sync_rows_by_ncop_id(
         "updated": updated,
         "unchanged": unchanged,
         "deleted": deleted,
+        "writeback_rows": writeback_rows,
     }
 
 def insert_rows(
